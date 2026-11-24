@@ -1,0 +1,19 @@
+{
+  "id": "/",
+  "name": "KKSRecap AI — Movie Recap Studio",
+  "short_name": "KKSRecap",
+  "description": "အဆင့်မြင့် AI စနစ်ဖြင့် မည်သည့် Video Link မဆို မြန်မာစာတန်းထိုးပါဝင်သော Viral Movie Recap MP4 အဖြစ် အခမဲ့ ဖြတ်တောက်ပေးသည့် စနစ်",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#09090B",
+  "theme_color": "#F59E0B",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

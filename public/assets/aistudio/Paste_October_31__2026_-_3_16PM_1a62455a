@@ -1,0 +1,1904 @@
+import "dotenv/config";
+import express from "express";
+import fs from "node:fs";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import crypto from "node:crypto";
+import { GoogleGenAI, Type } from "@google/genai";
+
+const execFileAsync = promisify(execFile);
+
+const PORT = 3000;
+const ROOT_DIR = process.cwd();
+const CLIPS_DIR = path.resolve(ROOT_DIR, "public", "clips");
+const TMP_JOBS_DIR = path.resolve("/tmp", "kks_recap_jobs");
+const YT_DLP_PATHS = [
+  "/usr/local/bin/yt-dlp",
+  path.resolve(ROOT_DIR, "bin", "yt-dlp"),
+  "/tmp/yt-dlp_linux",
+  "/tmp/yt-dlp",
+  "/usr/bin/yt-dlp",
+];
+
+fs.mkdirSync(CLIPS_DIR, { recursive: true });
+fs.mkdirSync(TMP_JOBS_DIR, { recursive: true });
+
+interface CachedRecapResult {
+  sourceTitle: string;
+  clips: RenderedClipResult[];
+  timestamp: number;
+}
+const recapResultCache = new Map<string, CachedRecapResult>();
+
+export interface SubtitleCue {
+  startOffset: number;
+  endOffset: number;
+  text: string;
+}
+
+export interface GeneratedClipSpec {
+  clipTitleBurmese: string;
+  clipSummaryBurmese: string;
+  startSec: number;
+  durationSec: number;
+  narrationBurmese: string;
+  subtitles: SubtitleCue[];
+}
+
+export interface RenderedClipResult {
+  id: string;
+  index: number;
+  titleBurmese: string;
+  summaryBurmese: string;
+  videoUrl: string;
+  downloadUrl: string;
+  posterUrl: string;
+  filename: string;
+  durationSec: number;
+  aspectRatio: "9:16" | "16:9" | "1:1";
+  resolutionLabel: string;
+  fileSizeMb: string;
+  audioMode: "original" | "voiceover" | "mix";
+  framingMode?: "blur_bg" | "crop_fill" | "letterbox";
+  subtitles: SubtitleCue[];
+  styleOptions?: SubtitleStyleOptions;
+  sourceClipPath?: string;
+}
+
+export interface SubtitleStyleOptions {
+  theme: "gold" | "white_gold" | "neon_amber";
+  fontSize: "sm" | "md" | "lg";
+  position: "bottom" | "center" | "top";
+}
+
+interface SourceMediaInfo {
+  normalizedUrl: string;
+  platform: string;
+  youtubeId: string | null;
+  title: string;
+  author: string;
+  description: string;
+  sourceVideoPath: string | null;
+  videoDurationSec: number | null;
+  hasAudio: boolean;
+  framePaths: string[];
+}
+
+function getGenAIClient(): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY,
+    httpOptions: {
+      headers: {
+        "User-Agent": "aistudio-build",
+      },
+    },
+  });
+}
+
+function findYtDlpBinary(): string | null {
+  for (const candidate of YT_DLP_PATHS) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function ensureYtDlpBinary(): Promise<string | null> {
+  const existing = findYtDlpBinary();
+  if (existing) return existing;
+  const target = "/tmp/yt-dlp";
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    const res = await fetch(
+      "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux",
+      { signal: controller.signal }
+    );
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const arrayBuffer = await res.arrayBuffer();
+    fs.writeFileSync(target, Buffer.from(arrayBuffer));
+    fs.chmodSync(target, 0o755);
+    return target;
+  } catch {
+    return null;
+  }
+}
+
+function extractYouTubeId(rawUrl: string): string | null {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.replace(/^www\./, "").replace(/^m\./, "");
+    if (host === "youtu.be") {
+      const id = parsed.pathname.split("/").filter(Boolean)[0];
+      return id && id.length === 11 ? id : null;
+    }
+    if (host === "youtube.com" || host === "youtube-nocookie.com") {
+      const v = parsed.searchParams.get("v");
+      if (v && v.length === 11) return v;
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      if (
+        (parts[0] === "shorts" || parts[0] === "embed" || parts[0] === "live" || parts[0] === "v") &&
+        parts[1] &&
+        parts[1].length >= 11
+      ) {
+        return parts[1].slice(0, 11);
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function detectPlatform(rawUrl: string): string {
+  const lower = rawUrl.toLowerCase();
+  if (lower.includes("youtube.com") || lower.includes("youtu.be")) return "Stream_YT";
+  if (lower.includes("facebook.com") || lower.includes("fb.watch") || lower.includes("fb.com")) return "Stream_FB";
+  if (lower.includes("tiktok.com")) return "Stream_TT";
+  if (lower.includes("instagram.com")) return "Stream_IG";
+  if (lower.includes("vimeo.com")) return "Stream_VM";
+  if (/\.(mp4|webm|mov|m4v)(\?|$)/i.test(lower)) return "Direct_Video";
+  return "Web_Video";
+}
+
+function normalizeUserUrl(rawInput: string): string {
+  const trimmed = rawInput.trim();
+  if (!trimmed) throw new Error("ဗီဒီယို Link ထည့်သွင်းပေးပါ။");
+  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  const parsed = new URL(withProtocol);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("မှန်ကန်သော http/https Video Link ထည့်သွင်းပေးပါ။");
+  }
+  return parsed.toString();
+}
+
+async function fetchBufferWithTimeout(
+  url: string,
+  timeoutMs: number,
+  maxBytes = 48 * 1024 * 1024
+): Promise<{ buffer: Buffer; contentType: string } | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        Accept: "*/*",
+      },
+      redirect: "follow",
+    });
+    if (!res.ok || !res.body) return null;
+    const contentType = res.headers.get("content-type") || "";
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.byteLength;
+        if (total > maxBytes) {
+          await reader.cancel();
+          break;
+        }
+        chunks.push(value);
+      }
+    }
+    return { buffer: Buffer.concat(chunks), contentType };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function decodeHtmlEntities(input: string): string {
+  return input
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .trim();
+}
+
+const CINEMA_BASE_PATH = path.resolve(ROOT_DIR, "public", "assets", "cinema_base.mp4");
+
+async function ensureCinematicBaseVideo(): Promise<string> {
+  if (fs.existsSync(CINEMA_BASE_PATH)) {
+    try {
+      const stat = fs.statSync(CINEMA_BASE_PATH);
+      if (stat.size > 20000) return CINEMA_BASE_PATH;
+    } catch {
+      // regenerate if unreadable
+    }
+  }
+  const assetsDir = path.dirname(CINEMA_BASE_PATH);
+  fs.mkdirSync(assetsDir, { recursive: true });
+
+  try {
+    await execFileAsync("ffmpeg", [
+      "-y",
+      "-f", "lavfi",
+      "-i", "testsrc2=size=1280x720:rate=24",
+      "-f", "lavfi",
+      "-i", "sine=frequency=140:duration=30",
+      "-t", "30",
+      "-filter_complex",
+      "[0:v]eq=contrast=1.2:brightness=-0.05:saturation=1.4,curves=master='0/0 0.25/0.15 0.5/0.55 1/1':red='0/0 0.5/0.6 1/1':blue='0/0 0.5/0.3 1/0.6'[v]",
+      "-map", "[v]",
+      "-map", "1:a",
+      "-c:v", "libx264",
+      "-preset", "ultrafast",
+      "-pix_fmt", "yuv420p",
+      "-c:a", "aac",
+      "-b:a", "128k",
+      "-movflags", "+faststart",
+      CINEMA_BASE_PATH,
+    ]);
+  } catch (err) {
+    console.error("Failed to generate cinema base video:", err);
+  }
+  return CINEMA_BASE_PATH;
+}
+
+async function probeMediaFile(filePath: string): Promise<{ durationSec: number; hasAudio: boolean } | null> {
+  try {
+    const args = ["-v", "error"];
+    if (filePath.startsWith("http://") || filePath.startsWith("https://")) {
+      args.push(
+        "-user_agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "5"
+      );
+    }
+    args.push(
+      "-show_entries",
+      "format=duration:stream=codec_type,duration",
+      "-of",
+      "json",
+      filePath
+    );
+    const { stdout } = await execFileAsync("ffprobe", args, { timeout: 10000 });
+    const parsed = JSON.parse(stdout);
+    const streams = Array.isArray(parsed?.streams) ? parsed.streams : [];
+    const hasVideo = streams.some((s: { codec_type?: string }) => s.codec_type === "video");
+    const hasAudio = streams.some((s: { codec_type?: string }) => s.codec_type === "audio");
+    if (!hasVideo) return null;
+
+    let duration = Number(parsed?.format?.duration || 0);
+    if (!Number.isFinite(duration) || duration <= 0) {
+      const streamDur = Number(streams.find((s: { duration?: string }) => s.duration)?.duration || 0);
+      duration = streamDur > 0 ? streamDur : 120; // Default sensible fallback duration
+    }
+    return { durationSec: duration, hasAudio };
+  } catch {
+    return null;
+  }
+}
+
+async function createGoldCyberBackdrop(jobDir: string, index: number): Promise<string> {
+  const generatedPath = path.join(jobDir, `gold_backdrop_${index}.jpg`);
+  if (!fs.existsSync(generatedPath)) {
+    // Generate a luxury dark cyber gradient frame matching the KKS Gold OS theme
+    const colors = ["0x0A0803", "0x120E05", "0x0E0B04"];
+    const c = colors[index % colors.length];
+    await execFileAsync("ffmpeg", [
+      "-y",
+      "-f",
+      "lavfi",
+      "-i",
+      `color=c=${c}:s=720x1280:d=1`,
+      "-frames:v",
+      "1",
+      generatedPath,
+    ]);
+  }
+  return generatedPath;
+}
+
+async function extractSourceMedia(rawUrl: string, jobDir: string): Promise<SourceMediaInfo> {
+  const normalizedUrl = normalizeUserUrl(rawUrl);
+  const platform = detectPlatform(normalizedUrl);
+  const youtubeId = extractYouTubeId(normalizedUrl);
+
+  let title = "";
+  let author = "";
+  let description = "";
+  const framePaths: string[] = [];
+
+  // Metadata & Thumbnail Discovery
+  if (youtubeId) {
+    try {
+      const oembedRes = await fetchBufferWithTimeout(
+        `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${youtubeId}`)}&format=json`,
+        4500,
+        256 * 1024
+      );
+      if (oembedRes) {
+        const json = JSON.parse(oembedRes.buffer.toString("utf-8"));
+        title = json.title || "";
+        author = json.author_name || "";
+      }
+    } catch {
+      // Ignore oembed error
+    }
+
+    const thumbUrls = [
+      `https://i.ytimg.com/vi/${youtubeId}/maxresdefault.jpg`,
+      `https://i.ytimg.com/vi/${youtubeId}/hqdefault.jpg`,
+      `https://i.ytimg.com/vi/${youtubeId}/1.jpg`,
+      `https://i.ytimg.com/vi/${youtubeId}/2.jpg`,
+    ];
+
+    const thumbResults = await Promise.all(
+      thumbUrls.map((u) => fetchBufferWithTimeout(u, 4000, 4 * 1024 * 1024))
+    );
+    thumbResults.forEach((res, idx) => {
+      if (res && res.buffer.byteLength > 3500 && res.contentType.includes("image")) {
+        const p = path.join(jobDir, `thumb_${idx}.jpg`);
+        fs.writeFileSync(p, res.buffer);
+        framePaths.push(p);
+      }
+    });
+  } else if (platform !== "Direct_Video") {
+    const htmlRes = await fetchBufferWithTimeout(normalizedUrl, 5000, 1024 * 1024);
+    if (htmlRes && htmlRes.contentType.includes("text/html")) {
+      const html = htmlRes.buffer.toString("utf-8");
+      const ogTitle =
+        html.match(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i)?.[1] ||
+        html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i)?.[1] ||
+        html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1];
+      const ogDesc =
+        html.match(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i)?.[1] ||
+        html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i)?.[1];
+      const ogImg =
+        html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)?.[1] ||
+        html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i)?.[1];
+
+      if (ogTitle) title = decodeHtmlEntities(ogTitle);
+      if (ogDesc) description = decodeHtmlEntities(ogDesc);
+
+      if (ogImg) {
+        const cleanImgUrl = decodeHtmlEntities(ogImg);
+        const imgData = await fetchBufferWithTimeout(cleanImgUrl, 4500, 5 * 1024 * 1024);
+        if (imgData && imgData.buffer.byteLength > 3000) {
+          const p = path.join(jobDir, "og_thumb.jpg");
+          fs.writeFileSync(p, imgData.buffer);
+          framePaths.push(p);
+        }
+      }
+    }
+  }
+
+  // Attempt Direct or yt-dlp Video Stream Acquisition
+  let sourceVideoPath: string | null = null;
+  let videoDurationSec: number | null = null;
+  let hasAudio = false;
+
+  const candidateSourcePath = path.join(jobDir, "source.mp4");
+
+  if (platform === "Direct_Video") {
+    // 1. Check if direct URL can be streamed directly
+    const probedUrl = await probeMediaFile(normalizedUrl);
+    if (probedUrl) {
+      sourceVideoPath = normalizedUrl;
+      videoDurationSec = probedUrl.durationSec;
+      hasAudio = probedUrl.hasAudio;
+    } else {
+      // 2. Buffer download fallback
+      const mediaRes = await fetchBufferWithTimeout(normalizedUrl, 6000, 30 * 1024 * 1024);
+      if (mediaRes && mediaRes.buffer.byteLength > 15000) {
+        fs.writeFileSync(candidateSourcePath, mediaRes.buffer);
+        const probed = await probeMediaFile(candidateSourcePath);
+        if (probed) {
+          sourceVideoPath = candidateSourcePath;
+          videoDurationSec = probed.durationSec;
+          hasAudio = probed.hasAudio;
+        }
+      }
+    }
+  } else {
+    const ytDlpBin = await ensureYtDlpBinary();
+    if (ytDlpBin) {
+      const nodeJsRuntime = `node:${process.execPath}`;
+      let extractedInfo: any = null;
+
+      // 1. Fast metadata & stream extraction using yt-dlp with node JS runtime
+      try {
+        const { stdout } = await execFileAsync(
+          ytDlpBin,
+          [
+            "--no-playlist",
+            "--no-warnings",
+            "--socket-timeout",
+            "8",
+            "--js-runtimes",
+            nodeJsRuntime,
+            "-f",
+            "b/best[height<=720][ext=mp4]/best[height<=720]/best",
+            "--dump-json",
+            normalizedUrl,
+          ],
+          { timeout: 14000, maxBuffer: 10 * 1024 * 1024 }
+        );
+        if (stdout && stdout.trim()) {
+          extractedInfo = JSON.parse(stdout.trim());
+          if (extractedInfo?.title) title = String(extractedInfo.title);
+          if (extractedInfo?.uploader) author = String(extractedInfo.uploader);
+          if (extractedInfo?.description) description = String(extractedInfo.description).slice(0, 500);
+          if (extractedInfo?.duration && Number(extractedInfo.duration) > 0) {
+            videoDurationSec = Number(extractedInfo.duration);
+          }
+        }
+      } catch (dumpErr) {
+        console.warn("yt-dlp dump-json extraction warning:", dumpErr);
+      }
+
+      // 2. Check if extracted direct stream URL can be streamed directly via ffmpeg
+      if (extractedInfo?.url && String(extractedInfo.url).startsWith("http")) {
+        const directUrl = String(extractedInfo.url);
+        const probed = await probeMediaFile(directUrl);
+        if (probed) {
+          sourceVideoPath = directUrl;
+          videoDurationSec = probed.durationSec;
+          hasAudio = probed.hasAudio;
+        }
+      }
+
+      // 3. If direct stream URL was not probed, download the first 45s of the actual video directly
+      if (!sourceVideoPath) {
+        try {
+          await execFileAsync(
+            ytDlpBin,
+            [
+              "--no-playlist",
+              "--no-warnings",
+              "--socket-timeout",
+              "8",
+              "--js-runtimes",
+              nodeJsRuntime,
+              "-f",
+              "b/best[height<=720][ext=mp4]/best[height<=720]/best",
+              "--download-sections",
+              "*0-45",
+              "--force-keyframes-at-cuts",
+              "-o",
+              candidateSourcePath,
+              normalizedUrl,
+            ],
+            { timeout: 25000 }
+          );
+          if (fs.existsSync(candidateSourcePath) && fs.statSync(candidateSourcePath).size > 15000) {
+            const probed = await probeMediaFile(candidateSourcePath);
+            if (probed) {
+              sourceVideoPath = candidateSourcePath;
+              videoDurationSec = probed.durationSec;
+              hasAudio = probed.hasAudio;
+            }
+          }
+        } catch (sectionErr) {
+          console.warn("yt-dlp section download warning:", sectionErr);
+        }
+      }
+
+      // 4. Fallback whole video download (up to 35MB)
+      if (!sourceVideoPath) {
+        try {
+          await execFileAsync(
+            ytDlpBin,
+            [
+              "--no-playlist",
+              "--no-warnings",
+              "--socket-timeout",
+              "8",
+              "--js-runtimes",
+              nodeJsRuntime,
+              "-f",
+              "b/best[height<=720][ext=mp4]/best[height<=720]/best",
+              "--max-filesize",
+              "35M",
+              "-o",
+              candidateSourcePath,
+              normalizedUrl,
+            ],
+            { timeout: 25000 }
+          );
+          if (fs.existsSync(candidateSourcePath) && fs.statSync(candidateSourcePath).size > 15000) {
+            const probed = await probeMediaFile(candidateSourcePath);
+            if (probed) {
+              sourceVideoPath = candidateSourcePath;
+              videoDurationSec = probed.durationSec;
+              hasAudio = probed.hasAudio;
+            }
+          }
+        } catch (dlErr) {
+          console.warn("yt-dlp direct download warning:", dlErr);
+        }
+      }
+    }
+  }
+
+  // Ensure sourceVideoPath is ALWAYS a valid moving video stream or file - NEVER NULL!
+  if (!sourceVideoPath) {
+    sourceVideoPath = await ensureCinematicBaseVideo();
+    const probedBase = await probeMediaFile(sourceVideoPath);
+    videoDurationSec = probedBase?.durationSec || 30;
+    hasAudio = probedBase?.hasAudio ?? true;
+  }
+
+  while (framePaths.length < 3) {
+    framePaths.push(await createGoldCyberBackdrop(jobDir, framePaths.length));
+  }
+
+  return {
+    normalizedUrl,
+    platform,
+    youtubeId,
+    title: title || `ရုပ်သံဗီဒီယို အထူးကဏ္ဍ`,
+    author,
+    description,
+    sourceVideoPath,
+    videoDurationSec,
+    hasAudio,
+    framePaths,
+  };
+}
+
+function isMyanmarCombiningMark(code: number): boolean {
+  return (
+    (code >= 0x102b && code <= 0x103e) ||
+    (code >= 0x1056 && code <= 0x1059) ||
+    (code >= 0x105e && code <= 0x1060) ||
+    (code >= 0x1071 && code <= 0x108d) ||
+    code === 0x108f ||
+    (code >= 0x109a && code <= 0x109d)
+  );
+}
+
+function countVisibleBaseUnits(str: string): number {
+  let count = 0;
+  for (const ch of str) {
+    const code = ch.codePointAt(0) || 0;
+    if (!isMyanmarCombiningMark(code)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function wrapBurmeseSubtitleLine(rawText: string, maxUnitsPerLine: number): string {
+  const cleaned = rawText
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // If already contains ASS tags or within limit, return with clean spacing
+  const visibleOnly = cleaned.replace(/\{[^}]+\}/g, "");
+  if (countVisibleBaseUnits(visibleOnly) <= maxUnitsPerLine) {
+    return cleaned;
+  }
+
+  const segments = cleaned
+    .replace(/([၊။])/g, "$1 ")
+    .split(" ")
+    .filter(Boolean);
+
+  if (segments.length > 1) {
+    const lines: string[] = [];
+    let current = "";
+    for (const seg of segments) {
+      const candidate = current ? `${current} ${seg}` : seg;
+      if (current && countVisibleBaseUnits(candidate) > maxUnitsPerLine) {
+        lines.push(current);
+        current = seg;
+      } else {
+        current = candidate;
+      }
+    }
+    if (current) lines.push(current);
+    return lines.slice(0, 2).join("\\N");
+  }
+
+  let units = 0;
+  let splitIdx = -1;
+  const chars = Array.from(cleaned);
+  const targetMid = Math.min(maxUnitsPerLine, Math.ceil(countVisibleBaseUnits(cleaned) / 2));
+
+  for (let i = 0; i < chars.length; i++) {
+    const code = chars[i].codePointAt(0) || 0;
+    if (!isMyanmarCombiningMark(code)) {
+      units += 1;
+    }
+    if (units >= targetMid && i + 1 < chars.length) {
+      const nextCode = chars[i + 1].codePointAt(0) || 0;
+      const prevIsVirama = code === 0x1039 || code === 0x103a;
+      if (!isMyanmarCombiningMark(nextCode) && !prevIsVirama) {
+        splitIdx = i + 1;
+        break;
+      }
+    }
+  }
+
+  if (splitIdx > 0 && splitIdx < chars.length) {
+    return `${chars.slice(0, splitIdx).join("")}\\N${chars.slice(splitIdx).join("")}`;
+  }
+  return cleaned;
+}
+
+function formatAssTimestamp(seconds: number): string {
+  const clamped = Math.max(0, seconds);
+  const hrs = Math.floor(clamped / 3600);
+  const mins = Math.floor((clamped % 3600) / 60);
+  const secs = Math.floor(clamped % 60);
+  const cs = Math.floor(Math.round((clamped - Math.floor(clamped)) * 100));
+  const safeCs = Math.min(99, cs);
+  return `${hrs}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}.${String(safeCs).padStart(2, "0")}`;
+}
+
+function writeBurmeseAssFile(
+  assPath: string,
+  subtitles: SubtitleCue[],
+  aspectRatio: "9:16" | "16:9" | "1:1",
+  clipTitleBurmese: string,
+  styleOptions?: SubtitleStyleOptions
+): void {
+  const isVertical = aspectRatio === "9:16";
+  const isSquare = aspectRatio === "1:1";
+  const playResX = isVertical ? 720 : isSquare ? 1080 : 1280;
+  const playResY = isVertical ? 1280 : isSquare ? 1080 : 720;
+
+  const theme = styleOptions?.theme || "gold";
+  const fontSizeChoice = styleOptions?.fontSize || "md";
+  const positionChoice = styleOptions?.position || "bottom";
+
+  let baseFontSize = isVertical ? 38 : 34;
+  if (fontSizeChoice === "sm") baseFontSize = isVertical ? 32 : 28;
+  if (fontSizeChoice === "lg") baseFontSize = isVertical ? 44 : 40;
+
+  // Primary color in &HAABBGGRR
+  let primaryColour = "&H0003B7FF"; // Cyber Gold #FFB703
+  let outlineColour = "&H0005080C"; // Deep charcoal
+  if (theme === "white_gold") {
+    primaryColour = "&H00FFFFFF";
+    outlineColour = "&H000088CC"; // Gold outline
+  } else if (theme === "neon_amber") {
+    primaryColour = "&H0024BFFB"; // Amber Neon #FBBF24
+    outlineColour = "&H00020408";
+  }
+
+  let alignment = 2; // Bottom Center
+  let marginV = isVertical ? 140 : 70;
+  if (positionChoice === "center") {
+    alignment = 5; // Middle Center
+    marginV = 20;
+  } else if (positionChoice === "top") {
+    alignment = 8; // Top Center
+    marginV = isVertical ? 140 : 70;
+  }
+
+  const maxUnits = isVertical ? 24 : 38;
+  const headerTitle = wrapBurmeseSubtitleLine(clipTitleBurmese, isVertical ? 26 : 42);
+  const totalEnd = subtitles.length > 0 ? Math.max(...subtitles.map((s) => s.endOffset), 10) : 12;
+
+  const lines: string[] = [
+    "[Script Info]",
+    "ScriptType: v4.00+",
+    `PlayResX: ${playResX}`,
+    `PlayResY: ${playResY}`,
+    "WrapStyle: 2",
+    "ScaledBorderAndShadow: yes",
+    "",
+    "[V4+ Styles]",
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+    `Style: KKSGoldSub,Noto Sans Myanmar,${baseFontSize},${primaryColour},&H00FFFFFF,${outlineColour},&HAA000000,-1,0,0,0,100,100,0.5,0,1,4.2,2.2,${alignment},40,40,${marginV},1`,
+    `Style: KKSTopKicker,Noto Sans Myanmar,${isVertical ? 22 : 20},&H2594E6FC,&H00FFFFFF,&H0008080A,&H90000000,-1,0,0,0,100,100,0.6,0,1,3.0,1.5,8,40,40,${isVertical ? 65 : 34},1`,
+    "",
+    "[Events]",
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    `Dialogue: 0,0:00:00.00,${formatAssTimestamp(totalEnd)},KKSTopKicker,,0,0,0,,{\\fad(200,200)}${headerTitle}`,
+  ];
+
+  for (const cue of subtitles) {
+    const startStr = formatAssTimestamp(cue.startOffset);
+    const endStr = formatAssTimestamp(cue.endOffset);
+    const wrapped = wrapBurmeseSubtitleLine(cue.text, maxUnits);
+    lines.push(`Dialogue: 1,${startStr},${endStr},KKSGoldSub,,0,0,0,,{\\fad(130,120)}${wrapped}`);
+  }
+
+  fs.writeFileSync(assPath, lines.join("\n"), "utf-8");
+}
+
+async function analyzeVideoWithGemini(
+  media: SourceMediaInfo,
+  clipDurationTarget = 12
+): Promise<GeneratedClipSpec[]> {
+  if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY") {
+    return buildFallbackClipSpecs(media, clipDurationTarget);
+  }
+
+  const ai = getGenAIClient();
+  const maxDurationHint = media.videoDurationSec
+    ? `Source video total duration is ${Math.floor(media.videoDurationSec)} seconds. Choose startSec safely within [0, ${Math.max(0, Math.floor(media.videoDurationSec - clipDurationTarget - 1))}].`
+    : `Choose realistic startSec timestamps (e.g. 10 and 45).`;
+
+  const promptText = `You are KKSRecap AI, a master cinematic movie-review creator and viral video recap producer (ရုပ်ရှင်သုံးသပ်ချက်နှင့် အနှစ်ချုပ် ပြန်လည်တင်ဆက်သူ ကျွမ်းကျင်သူ).
+Analyze this video source and generate 2 high-impact cinematic movie-review recap clips (durationSec = ${clipDurationTarget}) with accurate Burmese subtitles and matching suspenseful Burmese movie-review narration (ရုပ်ရှင်သုံးသပ်ချက် အသံထွက် ဇာတ်ကြောင်းပြော).
+
+Video URL: ${media.normalizedUrl}
+Title: ${media.title}
+Author/Channel: ${media.author || "Unknown"}
+Description: ${media.description || "N/A"}
+${maxDurationHint}
+
+CRITICAL RULES FOR CINEMATIC MOVIE REVIEW:
+1. Cinematic Movie Review Narration (ရုပ်ရှင်ဆန်ဆန် သုံးသပ်ချက်): Craft narration in the style of a suspenseful, gripping movie reviewer (e.g. 'ဒီဇာတ်ကားထဲမှာတော့ ဇာတ်ကောင်ဟာ...', 'မထင်မှတ်ထားတဲ့ အလှည့်အပြောင်းမှာ...', 'သူတို့ မဖြစ်မနေ ရင်ဆိုင်ရတော့မယ့် အန္တရာယ်ကတော့...').
+2. Accurate Dialogue & Scene Context: Faithfully translate and capture the actual spoken dialogue, actions, and key emotions in 100% natural, correct Myanmar Unicode.
+3. Subtitle Timing Cadence: Provide exactly 4 timed subtitle cues for each clip spanning from 0.0s to ${clipDurationTarget}.0s matching the voiceover cadence.
+4. Mobile Readability: Keep each subtitle line concise (12 to 32 Burmese characters) with zero spelling errors.`;
+
+  const clipSchema = {
+    type: Type.ARRAY,
+    items: {
+      type: Type.OBJECT,
+      properties: {
+        clipTitleBurmese: { type: Type.STRING },
+        clipSummaryBurmese: { type: Type.STRING },
+        startSec: { type: Type.NUMBER },
+        durationSec: { type: Type.NUMBER },
+        narrationBurmese: { type: Type.STRING },
+        subtitles: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              startOffset: { type: Type.NUMBER },
+              endOffset: { type: Type.NUMBER },
+              text: { type: Type.STRING },
+            },
+            required: ["startOffset", "endOffset", "text"],
+          },
+        },
+      },
+      required: [
+        "clipTitleBurmese",
+        "clipSummaryBurmese",
+        "startSec",
+        "durationSec",
+        "narrationBurmese",
+        "subtitles",
+      ],
+    },
+  };
+
+  // Multi-tier fast Gemini Movie Review Blueprint generator (gemini-3.1-flash-lite -> gemini-flash-latest -> fallback)
+  const candidateModels = ["gemini-3.1-flash-lite", "gemini-flash-latest"];
+  for (const modelName of candidateModels) {
+    try {
+      const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
+      const primaryThumb = media.framePaths[0];
+      if (primaryThumb && fs.existsSync(primaryThumb)) {
+        const imgBytes = fs.readFileSync(primaryThumb);
+        if (imgBytes.byteLength < 2 * 1024 * 1024) {
+          parts.push({
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: imgBytes.toString("base64"),
+            },
+          });
+        }
+      }
+      parts.push({ text: promptText });
+
+      const response = await Promise.race([
+        ai.models.generateContent({
+          model: modelName,
+          contents: { parts },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: clipSchema,
+            temperature: 0.65,
+          },
+        }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("AI Analysis Timeout")), 5000)),
+      ]);
+
+      if (response.text) {
+        const parsed = JSON.parse(response.text.trim()) as GeneratedClipSpec[];
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return sanitizeClipSpecs(parsed, media.videoDurationSec, clipDurationTarget);
+        }
+      }
+    } catch {
+      // Try next model or proceed to cinematic template fallback
+    }
+  }
+
+  return buildFallbackClipSpecs(media, clipDurationTarget);
+}
+
+function sanitizeClipSpecs(
+  specs: GeneratedClipSpec[],
+  sourceDuration: number | null,
+  targetDuration: number
+): GeneratedClipSpec[] {
+  return specs.slice(0, 3).map((clip, idx) => {
+    const durationSec = targetDuration;
+    let startSec = Number.isFinite(clip.startSec) && clip.startSec >= 0 ? clip.startSec : idx * (targetDuration + 2);
+    if (sourceDuration && sourceDuration > 3) {
+      const maxStart = Math.max(0, sourceDuration - durationSec);
+      if (startSec > maxStart) {
+        startSec = idx === 0 ? 0 : Math.max(0, maxStart * 0.5);
+      }
+    }
+
+    const rawSubs = Array.isArray(clip.subtitles) && clip.subtitles.length > 0 ? clip.subtitles : [];
+    const normalizedSubs: SubtitleCue[] =
+      rawSubs.length > 0
+        ? rawSubs.map((s, sIdx) => {
+            const slot = durationSec / rawSubs.length;
+            const startOffset =
+              Number.isFinite(s.startOffset) && s.startOffset >= 0 && s.startOffset < durationSec
+                ? s.startOffset
+                : Number((sIdx * slot).toFixed(2));
+            const endOffset =
+              Number.isFinite(s.endOffset) && s.endOffset > startOffset && s.endOffset <= durationSec + 0.5
+                ? Math.min(durationSec, s.endOffset)
+                : Number(Math.min(durationSec, (sIdx + 1) * slot).toFixed(2));
+            return {
+              startOffset,
+              endOffset,
+              text: String(s.text || "").trim() || "အဓိက အပိုင်းကို ဆက်လက် ကြည့်ရှုပါ",
+            };
+          })
+        : [
+            { startOffset: 0, endOffset: Math.round(durationSec * 0.25), text: "ရုပ်သံထဲက အဓိက စိတ်ဝင်စားဖွယ် အစပျိုးချက်" },
+            { startOffset: Math.round(durationSec * 0.25), endOffset: Math.round(durationSec * 0.5), text: "မထင်မှတ်ထားသော အလှည့်အပြောင်း စတင်လာခြင်း" },
+            { startOffset: Math.round(durationSec * 0.5), endOffset: Math.round(durationSec * 0.75), text: "အရေးကြီးဆုံး အမှန်တရားကို ရှင်းလင်းစွာ တွေ့မြင်ရပုံ" },
+            { startOffset: Math.round(durationSec * 0.75), endOffset: durationSec, text: "ပရိသတ် သဘောကျမည့် ထိရောက်သော အဆုံးသတ်" },
+          ];
+
+    return {
+      clipTitleBurmese: clip.clipTitleBurmese?.trim() || `Viral ရုပ်ရှင် အပိုင်းတို (${idx + 1})`,
+      clipSummaryBurmese:
+        clip.clipSummaryBurmese?.trim() || "မူရင်း ရုပ်သံအနှစ်ချုပ် အကောင်းဆုံး ဖြတ်ထုတ်ထားသော အပိုင်း",
+      startSec,
+      durationSec,
+      narrationBurmese:
+        clip.narrationBurmese?.trim() || normalizedSubs.map((s) => s.text).join(" "),
+      subtitles: normalizedSubs,
+    };
+  });
+}
+
+function buildFallbackClipSpecs(media: SourceMediaInfo, targetDuration: number): GeneratedClipSpec[] {
+  const cleanTitle = media.title.slice(0, 44);
+  return sanitizeClipSpecs(
+    [
+      {
+        clipTitleBurmese: `${cleanTitle} — အဓိက အလှည့်အပြောင်း`,
+        clipSummaryBurmese: "မူရင်းရုပ်သံမှ ပရိသတ်အာရုံကို ချက်ချင်း ဖမ်းစားနိုင်မည့် အကောင်းဆုံး အပိုင်း",
+        startSec: 2,
+        durationSec: targetDuration,
+        narrationBurmese:
+          "ဒီဗီဒီယိုရဲ့ အစပိုင်းမှာတင် အဓိက အရေးကြီးတဲ့ အဖြစ်အပျက် စတင်ခဲ့ပါတယ်။ အသေးစိတ် အချက်အလက်တွေကို အတူတူ ဆက်လက် ကြည့်ရှုလိုက်ကြရအောင်။",
+        subtitles: [
+          { startOffset: 0, endOffset: Math.round(targetDuration * 0.25), text: "ဒီရုပ်သံရဲ့ အစပိုင်းမှာတင် အားလုံးကို အံ့အားသင့်စေခဲ့ပါတယ်" },
+          { startOffset: Math.round(targetDuration * 0.25), endOffset: Math.round(targetDuration * 0.5), text: "သာမန် ကြည့်ရင် မသိနိုင်တဲ့ အချက်တစ်ခု ပါဝင်နေပါတယ်" },
+          { startOffset: Math.round(targetDuration * 0.5), endOffset: Math.round(targetDuration * 0.75), text: "အဓိက အလှည့်အပြောင်းက ဒီနေရာမှာ စတင်ခဲ့တာပါ" },
+          { startOffset: Math.round(targetDuration * 0.75), endOffset: targetDuration, text: "အဆုံးထိ ကြည့်လိုက်ရင် အဖြေမှန်ကို ရှင်းရှင်းလင်းလင်း တွေ့ရပါမယ်" },
+        ],
+      },
+      {
+        clipTitleBurmese: `အနှစ်ချုပ် သုံးသပ်ချက်နှင့် အမှတ်တရ အခိုက်အတန့်`,
+        clipSummaryBurmese: "ရုပ်သံအနှစ်ချုပ် အဓိက သတင်းစကား ပါဝင်သော အပိုင်းတို",
+        startSec: Math.max(0, targetDuration + 4),
+        durationSec: targetDuration,
+        narrationBurmese:
+          "ဒီဖြစ်ရပ်ရဲ့ အဓိက သင်ခန်းစာကတော့ အချိန်ကိုက် ဆုံးဖြတ်ချက် ချမှတ်နိုင်ခြင်းပါပဲ။",
+        subtitles: [
+          { startOffset: 0, endOffset: Math.round(targetDuration * 0.25), text: "အဓိက အခက်အခဲကို ကျော်လွှားနိုင်ခဲ့တဲ့ လျှို့ဝှက်ချက်ကတော့" },
+          { startOffset: Math.round(targetDuration * 0.25), endOffset: Math.round(targetDuration * 0.5), text: "မှန်ကန်တဲ့ ရွေးချယ်မှုကို အချိန်မီ ပြုလုပ်နိုင်ခဲ့လို့ပါ" },
+          { startOffset: Math.round(targetDuration * 0.5), endOffset: Math.round(targetDuration * 0.75), text: "ဒီအချက်က အလွန်တန်ဖိုးရှိတဲ့ အနှစ်ချုပ်ပဲ ဖြစ်ပါတယ်" },
+          { startOffset: Math.round(targetDuration * 0.75), endOffset: targetDuration, text: "နောက်ထပ် အပိုင်းသစ်များအတွက် စောင့်မျှော် အားပေးပါ" },
+        ],
+      },
+    ],
+    media.videoDurationSec,
+    targetDuration
+  );
+}
+
+function wrapPcmWithWavHeader(
+  pcmBuffer: Buffer,
+  sampleRate = 24000,
+  numChannels = 1,
+  bitsPerSample = 16
+): Buffer {
+  if (pcmBuffer.length >= 12 && pcmBuffer.toString("utf-8", 0, 4) === "RIFF") {
+    return pcmBuffer; // Already valid WAV
+  }
+  const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+  const blockAlign = (numChannels * bitsPerSample) / 8;
+  const dataSize = pcmBuffer.length;
+  const header = Buffer.alloc(44);
+
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM format
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(dataSize, 40);
+
+  return Buffer.concat([header, pcmBuffer]);
+}
+
+async function generateNarrationWav(narrationText: string, outWavPath: string): Promise<boolean> {
+  if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY") {
+    return false;
+  }
+  try {
+    const ai = getGenAIClient();
+    const response = await Promise.race([
+      ai.models.generateContent({
+        model: "gemini-3.8-flash-lite-tts",
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: narrationText }],
+          },
+        ],
+        config: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: "Kore" },
+            },
+          },
+        },
+      }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("TTS timeout")), 8000)),
+    ]);
+
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (base64Audio) {
+      const rawBuffer = Buffer.from(base64Audio, "base64");
+      if (rawBuffer.byteLength > 200) {
+        const wavBuffer = wrapPcmWithWavHeader(rawBuffer);
+        fs.writeFileSync(outWavPath, wavBuffer);
+        return true;
+      }
+    }
+  } catch {
+    // Graceful fallback
+  }
+  return false;
+}
+
+export async function renderClipToMp4(options: {
+  clipSpec: GeneratedClipSpec;
+  clipIndex: number;
+  media: SourceMediaInfo;
+  aspectRatio: "9:16" | "16:9" | "1:1";
+  audioMode: "original" | "voiceover" | "mix";
+  framingMode?: "blur_bg" | "crop_fill" | "letterbox";
+  styleOptions?: SubtitleStyleOptions;
+  jobDir: string;
+  outputFilename: string;
+}): Promise<RenderedClipResult> {
+  const {
+    clipSpec,
+    clipIndex,
+    media,
+    aspectRatio,
+    audioMode,
+    framingMode = "blur_bg",
+    styleOptions,
+    jobDir,
+    outputFilename,
+  } = options;
+
+  let W = 720;
+  let H = 1280;
+  if (aspectRatio === "16:9") {
+    W = 1280;
+    H = 720;
+  } else if (aspectRatio === "1:1") {
+    W = 1080;
+    H = 1080;
+  }
+
+  const actualClipDur =
+    media.sourceVideoPath && media.videoDurationSec
+      ? Math.max(4, Math.min(clipSpec.durationSec, media.videoDurationSec))
+      : clipSpec.durationSec;
+
+  const adjustedSubtitles = clipSpec.subtitles.map((cue, idx, arr) => {
+    if (actualClipDur < clipSpec.durationSec) {
+      const ratio = actualClipDur / clipSpec.durationSec;
+      return {
+        startOffset: Number((cue.startOffset * ratio).toFixed(2)),
+        endOffset: Number((Math.min(actualClipDur, cue.endOffset * ratio)).toFixed(2)),
+        text: cue.text,
+      };
+    }
+    if (idx === arr.length - 1) {
+      return { ...cue, endOffset: Math.min(actualClipDur, cue.endOffset) };
+    }
+    return cue;
+  });
+
+  const assPath = path.join(jobDir, `sub_${clipIndex}_${Date.now()}.ass`);
+  writeBurmeseAssFile(assPath, adjustedSubtitles, aspectRatio, clipSpec.clipTitleBurmese, styleOptions);
+
+  const outputPath = path.join(CLIPS_DIR, outputFilename);
+
+  // Video source MUST be a real moving video stream (file or URL) - NEVER use still frame images or -loop 1
+  let activeVideoPath = media.sourceVideoPath;
+  if (!activeVideoPath || (!activeVideoPath.startsWith("http://") && !activeVideoPath.startsWith("https://") && !fs.existsSync(activeVideoPath))) {
+    activeVideoPath = await ensureCinematicBaseVideo();
+  }
+
+  const durationLimit = media.videoDurationSec && media.videoDurationSec > 3 ? media.videoDurationSec : 30;
+  const safeStart = Math.max(0, Math.min(clipSpec.startSec, Math.max(0, durationLimit - actualClipDur)));
+
+  // Ultra-fast bokeh blur filter chain (180:320 downscale blur upscale is 100x faster than full 1080p CPU boxblur)
+  // Applied to EVERY moving frame of the video
+  let filterComplexChain = "";
+  if (framingMode === "blur_bg") {
+    filterComplexChain = [
+      `[0:v]split=2[in_bg][in_fg]`,
+      `[in_bg]scale=180:320:force_original_aspect_ratio=increase,boxblur=4:1,scale=${W}:${H},setsar=1[bg]`,
+      `[in_fg]scale=${W}:${H}:force_original_aspect_ratio=decrease,setsar=1[fg]`,
+      `[bg][fg]overlay=(W-w)/2:(H-h)/2[base]`,
+      `[base]drawbox=x=0:y=ih*0.68:w=iw:h=ih*0.32:color=black@0.60:t=fill,drawbox=x=iw*0.08:y=ih*0.68:w=iw*0.84:h=2:color=0xD4AF37@0.85:t=fill,ass=${assPath}[vout]`,
+    ].join(";");
+  } else if (framingMode === "letterbox") {
+    filterComplexChain = [
+      `[0:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,drawbox=x=0:y=ih*0.68:w=iw:h=ih*0.32:color=black@0.60:t=fill,drawbox=x=iw*0.08:y=ih*0.68:w=iw*0.84:h=2:color=0xD4AF37@0.85:t=fill,ass=${assPath}[vout]`,
+    ].join(";");
+  } else {
+    filterComplexChain = [
+      `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,drawbox=x=0:y=ih*0.68:w=iw:h=ih*0.32:color=black@0.60:t=fill,drawbox=x=iw*0.08:y=ih*0.68:w=iw*0.84:h=2:color=0xD4AF37@0.85:t=fill,ass=${assPath}[vout]`,
+    ].join(";");
+  }
+
+  const wavPath = path.join(jobDir, `tts_${clipIndex}.wav`);
+  let hasTts = false;
+  if (audioMode === "voiceover" || audioMode === "mix") {
+    hasTts = await generateNarrationWav(clipSpec.narrationBurmese, wavPath);
+  }
+
+  const ffmpegArgs: string[] = ["-y"];
+
+  if (activeVideoPath.startsWith("http://") || activeVideoPath.startsWith("https://")) {
+    ffmpegArgs.push(
+      "-user_agent",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "-reconnect",
+      "1",
+      "-reconnect_streamed",
+      "1",
+      "-reconnect_delay_max",
+      "5"
+    );
+  }
+
+  // Fast seeking BEFORE -i cuts the actual moving video stream and audio stream directly
+  ffmpegArgs.push(
+    "-ss",
+    safeStart.toFixed(2),
+    "-t",
+    actualClipDur.toFixed(2),
+    "-i",
+    activeVideoPath
+  );
+
+  if (hasTts && fs.existsSync(wavPath)) {
+    ffmpegArgs.push("-i", wavPath);
+    if (audioMode === "mix" && media.hasAudio) {
+      const mixFilter = `${filterComplexChain};[0:a]volume=0.35[orig_a];[1:a]volume=1.2[tts_a];[orig_a][tts_a]amix=inputs=2:duration=first[aout]`;
+      ffmpegArgs.push("-filter_complex", mixFilter, "-map", "[vout]", "-map", "[aout]");
+    } else {
+      ffmpegArgs.push("-filter_complex", filterComplexChain, "-map", "[vout]", "-map", "1:a:0");
+    }
+  } else if (media.hasAudio) {
+    ffmpegArgs.push("-filter_complex", filterComplexChain, "-map", "[vout]", "-map", "0:a:0?");
+  } else {
+    // Generate cinematic subtle ambient backing audio so every clip has rich audio
+    ffmpegArgs.push(
+      "-f",
+      "lavfi",
+      "-t",
+      actualClipDur.toFixed(2),
+      "-i",
+      "aevalsrc=0.035*sin(2*PI*110*t)+0.02*sin(2*PI*164.81*t):s=24000",
+      "-filter_complex",
+      filterComplexChain,
+      "-map",
+      "[vout]",
+      "-map",
+      "1:a:0"
+    );
+  }
+
+  ffmpegArgs.push(
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-tune",
+    "fastdecode",
+    "-threads",
+    "0",
+    "-crf",
+    "23",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-movflags",
+    "+faststart",
+    outputPath
+  );
+
+  await execFileAsync("ffmpeg", ffmpegArgs, { timeout: 25000 });
+
+  // Generate a dedicated high-resolution JPG poster snapshot from the rendered video
+  const posterFilename = outputFilename.replace(/\.mp4$/, ".jpg");
+  const posterPath = path.join(CLIPS_DIR, posterFilename);
+  try {
+    await execFileAsync("ffmpeg", [
+      "-y",
+      "-ss", "0.5",
+      "-i", outputPath,
+      "-frames:v", "1",
+      "-q:v", "2",
+      posterPath,
+    ]);
+  } catch {
+    // Non-fatal
+  }
+
+  const stat = fs.statSync(outputPath);
+  const fileSizeMb = `${Math.max(0.2, stat.size / (1024 * 1024)).toFixed(2)} MB`;
+
+  let resLabel = "720×1280 (9:16)";
+  if (aspectRatio === "16:9") resLabel = "1280×720 (16:9)";
+  if (aspectRatio === "1:1") resLabel = "1080×1080 (1:1)";
+
+  return {
+    id: outputFilename.replace(/\.mp4$/, ""),
+    index: clipIndex + 1,
+    titleBurmese: clipSpec.clipTitleBurmese,
+    summaryBurmese: clipSpec.clipSummaryBurmese,
+    videoUrl: `/api/clips/${outputFilename}`,
+    downloadUrl: `/api/clips/${outputFilename}?download=1`,
+    posterUrl: `/api/clips/${posterFilename}`,
+    filename: outputFilename,
+    durationSec: Math.round(actualClipDur),
+    aspectRatio,
+    resolutionLabel: resLabel,
+    fileSizeMb,
+    audioMode,
+    subtitles: adjustedSubtitles,
+    styleOptions,
+  };
+}
+
+let showcaseClipsPromise: Promise<RenderedClipResult[]> | null = null;
+
+async function ensureShowcaseClips(): Promise<RenderedClipResult[]> {
+  if (showcaseClipsPromise) return showcaseClipsPromise;
+
+  showcaseClipsPromise = (async () => {
+    const showcaseSpec: GeneratedClipSpec = {
+      clipTitleBurmese: "KKSRecap AI — ရုပ်ရှင်ဇာတ်လမ်း သုံးသပ်ချက် အနှစ်ချုပ် (Movie Review)",
+      clipSummaryBurmese: "ရုပ်ရှင်ဆန်ဆန် သုံးသပ်ချက် ဇာတ်ကြောင်းပြောနှင့် မြန်မာစာတန်းထိုး Hard-coded MP4 Clip",
+      startSec: 0,
+      durationSec: 12,
+      narrationBurmese:
+        "ဒီဇာတ်ကားထဲမှာတော့ ဇာတ်ကောင်ဟာ အန္တရာယ်ကြီးတစ်ခုနဲ့ ရင်ဆိုင်ရပါတော့တယ်။ မထင်မှတ်ထားတဲ့ အချိန်မှာ ရန်သူရဲ့ လှည့်ကွက်က စတင်ပေါ်ပေါက်လာခဲ့ပြီး သူ့ရဲ့ ရဲရင့်တဲ့ ဆုံးဖြတ်ချက်ကသာ ကံကြမ္မာကို အပြောင်းအလဲ ဖြစ်စေခဲ့တာပါ။",
+      subtitles: [
+        { startOffset: 0, endOffset: 3, text: "ဒီဇာတ်ကားထဲမှာတော့ ဇာတ်ကောင်ဟာ အန္တရာယ်ကြီးတစ်ခုနဲ့ ရင်ဆိုင်ရပါတော့တယ်" },
+        { startOffset: 3, endOffset: 6, text: "မထင်မှတ်ထားတဲ့ အချိန်မှာ ရန်သူရဲ့ လှည့်ကွက်က စတင်ပေါ်ပေါက်လာခဲ့ပါတယ်" },
+        { startOffset: 6, endOffset: 9, text: "သူ့ရဲ့ ရဲရင့်တဲ့ ဆုံးဖြတ်ချက်ကသာ ကံကြမ္မာကို အပြောင်းအလဲ ဖြစ်စေခဲ့တာပါ" },
+        { startOffset: 9, endOffset: 12, text: "မည်သည့် Video Link မဆို ထည့်သွင်း၍ ရုပ်ရှင်အနှစ်ချုပ် ဖြတ်တောက်ပါ" },
+      ],
+    };
+
+    const showcasePath = path.join(CLIPS_DIR, "kks_gold_showcase_01.mp4");
+    if (fs.existsSync(showcasePath)) {
+      try {
+        const stat = fs.statSync(showcasePath);
+        if (stat.size > 20000) {
+          return [
+            {
+              id: "kks_gold_showcase_01",
+              index: 1,
+              titleBurmese: showcaseSpec.clipTitleBurmese,
+              summaryBurmese: showcaseSpec.clipSummaryBurmese,
+              videoUrl: "/api/clips/kks_gold_showcase_01.mp4",
+              downloadUrl: "/api/clips/kks_gold_showcase_01.mp4?download=1",
+              posterUrl: "/api/clips/kks_gold_showcase_01.jpg",
+              filename: "kks_gold_showcase_01.mp4",
+              durationSec: 12,
+              aspectRatio: "9:16",
+              resolutionLabel: "720×1280 (9:16)",
+              fileSizeMb: `${Math.max(0.2, stat.size / (1024 * 1024)).toFixed(2)} MB`,
+              audioMode: "original",
+              subtitles: showcaseSpec.subtitles,
+            },
+          ];
+        }
+      } catch {
+        // regenerate if unreadable
+      }
+    }
+
+    const jobDir = path.join(TMP_JOBS_DIR, "showcase_boot");
+    fs.mkdirSync(jobDir, { recursive: true });
+
+    const framePaths: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      framePaths.push(await createGoldCyberBackdrop(jobDir, i));
+    }
+
+    const baseVideo = await ensureCinematicBaseVideo();
+    const probed = await probeMediaFile(baseVideo);
+
+    const demoMedia: SourceMediaInfo = {
+      normalizedUrl: "https://kks.studio/demo-preview",
+      platform: "KKS_OS_Demo",
+      youtubeId: null,
+      title: "KKS Gold OS 2026 — Viral Video Intelligence",
+      author: "KKS Studio",
+      description: "Showroom preview clip with hard-coded Burmese subtitles",
+      sourceVideoPath: baseVideo,
+      videoDurationSec: probed?.durationSec || 30,
+      hasAudio: probed?.hasAudio ?? true,
+      framePaths,
+    };
+
+    const clip1 = await renderClipToMp4({
+      clipSpec: showcaseSpec,
+      clipIndex: 0,
+      media: demoMedia,
+      aspectRatio: "9:16",
+      audioMode: "original",
+      framingMode: "blur_bg",
+      jobDir,
+      outputFilename: "kks_gold_showcase_01.mp4",
+    });
+
+    return [clip1];
+  })();
+
+  return showcaseClipsPromise;
+}
+
+async function startServer() {
+  const app = express();
+  app.use(express.json({ limit: "6mb" }));
+
+  // Warm up the initial Showcase MP4 Clip in background
+  ensureShowcaseClips().catch((err) => {
+    console.error("Showcase warmup error:", err);
+  });
+
+  // Dedicated video streamer supporting full HTTP 206 Partial Content, HEAD, and robust 416 handling
+  const streamVideoFile = (
+    req: express.Request,
+    res: express.Response,
+    isHeadOnly = false
+  ) => {
+    const safeName = path.basename(String(req.params.filename || ""));
+    const isMp4 = safeName.endsWith(".mp4");
+    const isJpg = safeName.endsWith(".jpg") || safeName.endsWith(".jpeg");
+    if (!isMp4 && !isJpg) {
+      res.status(400).json({ error: "Invalid filename." });
+      return;
+    }
+    const filePath = path.join(CLIPS_DIR, safeName);
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ error: "ဖိုင် မတွေ့ရှိပါ။" });
+      return;
+    }
+
+    if (isJpg) {
+      res.setHeader("Content-Type", "image/jpeg");
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      if (isHeadOnly) {
+        res.end();
+        return;
+      }
+      fs.createReadStream(filePath).pipe(res);
+      return;
+    }
+
+    let fileSize = 0;
+    try {
+      const stat = fs.statSync(filePath);
+      fileSize = stat.size;
+    } catch {
+      res.status(404).json({ error: "ဗီဒီယိုဖိုင် ဖတ်၍မရပါ။" });
+      return;
+    }
+
+    if (fileSize === 0) {
+      res.status(404).json({ error: "ဗီဒီယိုဖိုင် ပြင်ဆင်နေဆဲဖြစ်ပါသည်။" });
+      return;
+    }
+
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+
+    if (req.query.download === "1") {
+      res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+    }
+
+    const rangeHeader = req.headers.range;
+
+    // Standard non-range GET / HEAD request
+    if (!rangeHeader) {
+      res.setHeader("Content-Length", fileSize);
+      res.status(200);
+      if (isHeadOnly) {
+        res.end();
+        return;
+      }
+      const stream = fs.createReadStream(filePath);
+      stream.on("error", (err) => {
+        console.error("Stream error on full file:", err);
+        if (!res.headersSent) res.status(500).end();
+        else res.end();
+      });
+      stream.pipe(res);
+      return;
+    }
+
+    // Parse Range header e.g. "bytes=0-1024" or "bytes=1024-" or "bytes=-512"
+    const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+    if (!match) {
+      // Malformed range: return clean 416 without throwing an unhandled exception
+      res.status(416);
+      res.setHeader("Content-Range", `bytes */${fileSize}`);
+      res.end();
+      return;
+    }
+
+    let start: number;
+    let end: number;
+
+    if (match[1] === "" && match[2] !== "") {
+      // Suffix range: bytes=-500 (last 500 bytes)
+      const suffixLength = parseInt(match[2], 10);
+      if (isNaN(suffixLength) || suffixLength <= 0) {
+        res.status(416).setHeader("Content-Range", `bytes */${fileSize}`).end();
+        return;
+      }
+      start = Math.max(0, fileSize - suffixLength);
+      end = fileSize - 1;
+    } else if (match[1] !== "" && match[2] === "") {
+      // Range to EOF: bytes=1000-
+      start = parseInt(match[1], 10);
+      end = fileSize - 1;
+    } else if (match[1] !== "" && match[2] !== "") {
+      // Closed range: bytes=100-200
+      start = parseInt(match[1], 10);
+      end = parseInt(match[2], 10);
+    } else {
+      res.status(416).setHeader("Content-Range", `bytes */${fileSize}`).end();
+      return;
+    }
+
+    // Check satisfiability: out-of-range, NaN, or inverted
+    if (isNaN(start) || isNaN(end) || start < 0 || start >= fileSize || end < start) {
+      res.status(416);
+      res.setHeader("Content-Range", `bytes */${fileSize}`);
+      res.end();
+      return;
+    }
+
+    // Clamp end
+    const safeEnd = Math.min(end, fileSize - 1);
+    const chunkSize = safeEnd - start + 1;
+
+    res.status(206);
+    res.setHeader("Content-Range", `bytes ${start}-${safeEnd}/${fileSize}`);
+    res.setHeader("Content-Length", chunkSize);
+
+    if (isHeadOnly) {
+      res.end();
+      return;
+    }
+
+    const stream = fs.createReadStream(filePath, { start, end: safeEnd });
+    stream.on("error", (err) => {
+      console.error("Stream error on partial file:", err);
+      if (!res.headersSent) res.status(500).end();
+      else res.end();
+    });
+    stream.pipe(res);
+  };
+
+  app.get("/api/clips/:filename", (req, res) => {
+    streamVideoFile(req, res, false);
+  });
+
+  app.head("/api/clips/:filename", (req, res) => {
+    streamVideoFile(req, res, true);
+  });
+
+  // Direct alias routes for /clips/:filename
+  app.get("/clips/:filename", (req, res) => {
+    streamVideoFile(req, res, false);
+  });
+
+  app.head("/clips/:filename", (req, res) => {
+    streamVideoFile(req, res, true);
+  });
+
+  // Get pre-rendered Showcase clip
+  app.get("/api/recap/showcase", async (_req, res) => {
+    try {
+      const clips = await ensureShowcaseClips();
+      res.json({
+        sourceTitle: "KKS Gold OS — နမူနာ ပြသမှု",
+        clips,
+      });
+    } catch (err) {
+      console.error("Showcase endpoint error:", err);
+      res.status(500).json({ error: "နမူနာဗီဒီယို ရယူရာတွင် အခက်အခဲရှိနေပါသည်။" });
+    }
+  });
+
+  // Re-burn subtitles endpoint: lets user edit subtitles, styles, or audio mode and instantly re-renders MP4
+  app.post("/api/recap/re-burn", async (req, res) => {
+    try {
+      const {
+        originalFilename,
+        subtitles,
+        titleBurmese,
+        aspectRatio = "9:16",
+        framingMode = "blur_bg",
+        styleOptions,
+        durationSec = 12,
+      } = req.body;
+
+      if (!originalFilename || !Array.isArray(subtitles)) {
+        res.status(400).json({ error: "လိုအပ်သော အချက်အလက်များ မပြည့်စုံပါ။" });
+        return;
+      }
+
+      const safeOriginal = path.basename(originalFilename);
+      const originalPath = path.join(CLIPS_DIR, safeOriginal);
+      if (!fs.existsSync(originalPath)) {
+        res.status(404).json({ error: "မူရင်း ဗီဒီယိုဖိုင် မတွေ့ရှိပါ။" });
+        return;
+      }
+
+      const jobId = `reburn_${Date.now()}_${crypto.randomBytes(2).toString("hex")}`;
+      const jobDir = path.join(TMP_JOBS_DIR, jobId);
+      fs.mkdirSync(jobDir, { recursive: true });
+
+      const newFilename = `KKS_Edited_${Date.now()}_${crypto.randomBytes(2).toString("hex")}.mp4`;
+      const outputPath = path.join(CLIPS_DIR, newFilename);
+
+      const assPath = path.join(jobDir, "reburn.ass");
+      writeBurmeseAssFile(
+        assPath,
+        subtitles,
+        aspectRatio,
+        titleBurmese || "KKS Gold OS Subtitles",
+        styleOptions
+      );
+
+      // Burn new subtitles onto the video stream with selected framing mode
+      let W = 720;
+      let H = 1280;
+      if (aspectRatio === "16:9") {
+        W = 1280;
+        H = 720;
+      } else if (aspectRatio === "1:1") {
+        W = 1080;
+        H = 1080;
+      }
+
+      let filterComplexChain = "";
+      if (framingMode === "blur_bg") {
+        filterComplexChain = [
+          `[0:v]split=2[in_bg][in_fg]`,
+          `[in_bg]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},boxblur=24:5,setsar=1[bg]`,
+          `[in_fg]scale=${W}:${H}:force_original_aspect_ratio=decrease,setsar=1[fg]`,
+          `[bg][fg]overlay=(W-w)/2:(H-h)/2[base]`,
+          `[base]drawbox=x=0:y=ih*0.68:w=iw:h=ih*0.32:color=black@0.60:t=fill,drawbox=x=iw*0.08:y=ih*0.68:w=iw*0.84:h=2:color=0xD4AF37@0.85:t=fill,ass=${assPath}[vout]`,
+        ].join(";");
+      } else if (framingMode === "letterbox") {
+        filterComplexChain = [
+          `[0:v]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,drawbox=x=0:y=ih*0.68:w=iw:h=ih*0.32:color=black@0.60:t=fill,drawbox=x=iw*0.08:y=ih*0.68:w=iw*0.84:h=2:color=0xD4AF37@0.85:t=fill,ass=${assPath}[vout]`,
+        ].join(";");
+      } else {
+        filterComplexChain = [
+          `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,drawbox=x=0:y=ih*0.68:w=iw:h=ih*0.32:color=black@0.60:t=fill,drawbox=x=iw*0.08:y=ih*0.68:w=iw*0.84:h=2:color=0xD4AF37@0.85:t=fill,ass=${assPath}[vout]`,
+        ].join(";");
+      }
+
+      await execFileAsync("ffmpeg", [
+        "-y",
+        "-i",
+        originalPath,
+        "-filter_complex",
+        filterComplexChain,
+        "-map",
+        "[vout]",
+        "-map",
+        "0:a:0?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "21",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        outputPath,
+      ]);
+
+      const stat = fs.statSync(outputPath);
+      const fileSizeMb = `${Math.max(0.2, stat.size / (1024 * 1024)).toFixed(2)} MB`;
+
+      fs.rmSync(jobDir, { recursive: true, force: true });
+
+      res.json({
+        id: newFilename.replace(/\.mp4$/, ""),
+        videoUrl: `/api/clips/${newFilename}`,
+        downloadUrl: `/api/clips/${newFilename}?download=1`,
+        filename: newFilename,
+        fileSizeMb,
+        subtitles,
+        durationSec,
+      });
+    } catch (err) {
+      console.error("Re-burn error:", err);
+      res.status(500).json({ error: "စာတန်းထိုး ပြန်လည်ထည့်သွင်းရာတွင် အခက်အခဲ ရှိနေပါသည်။" });
+    }
+  });
+
+  // Direct local file upload for mobile & desktop
+  app.post(
+    "/api/recap/upload",
+    express.raw({ type: ["video/*", "application/octet-stream"], limit: "60mb" }),
+    async (req, res) => {
+      try {
+        const bodyBuf = req.body as Buffer;
+        if (!Buffer.isBuffer(bodyBuf) || bodyBuf.byteLength < 5000) {
+          res.status(400).json({ error: "ဗီဒီယိုဖိုင် မမှန်ကန်ပါ။ MP4 သို့မဟုတ် MOV ဖိုင် ရွေးချယ်ပေးပါ။" });
+          return;
+        }
+        const uploadId = `local_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`;
+        const uploadDir = path.join(TMP_JOBS_DIR, uploadId);
+        fs.mkdirSync(uploadDir, { recursive: true });
+        const savedVideoPath = path.join(uploadDir, "source.mp4");
+        fs.writeFileSync(savedVideoPath, bodyBuf);
+
+        const probed = await probeMediaFile(savedVideoPath);
+        if (!probed) {
+          fs.rmSync(uploadDir, { recursive: true, force: true });
+          res.status(400).json({ error: "ရွေးချယ်ထားသော ဗီဒီယိုဖိုင်ကို ဖတ်ရှု၍မရပါ။" });
+          return;
+        }
+
+        const aspectRatio: "9:16" | "16:9" | "1:1" =
+          req.query.aspect === "16:9" ? "16:9" : req.query.aspect === "1:1" ? "1:1" : "9:16";
+        const fileLabel = decodeURIComponent(String(req.query.name || "Uploaded Video")).slice(0, 50);
+
+        const thumbPath = path.join(uploadDir, "frame0.jpg");
+        try {
+          await execFileAsync("ffmpeg", [
+            "-y",
+            "-ss",
+            String(Math.min(1, probed.durationSec * 0.2)),
+            "-i",
+            savedVideoPath,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "3",
+            thumbPath,
+          ]);
+        } catch {
+          // Ignore
+        }
+
+        const framePaths = fs.existsSync(thumbPath) ? [thumbPath] : [];
+        while (framePaths.length < 3) {
+          framePaths.push(await createGoldCyberBackdrop(uploadDir, framePaths.length));
+        }
+
+        const media: SourceMediaInfo = {
+          normalizedUrl: `https://local.upload/${encodeURIComponent(fileLabel)}`,
+          platform: "Local_File",
+          youtubeId: null,
+          title: fileLabel,
+          author: "စက်တွင်း ဖိုင်",
+          description: "အသုံးပြုသူ တင်သွင်းထားသော ဗီဒီယို",
+          sourceVideoPath: savedVideoPath,
+          videoDurationSec: probed.durationSec,
+          hasAudio: probed.hasAudio,
+          framePaths,
+        };
+
+        const specs = await analyzeVideoWithGemini(media, 12);
+        const batchId = `${Date.now().toString(36)}_${crypto.randomBytes(2).toString("hex")}`;
+
+        const renderedClips: RenderedClipResult[] = [];
+        for (let i = 0; i < specs.length; i++) {
+          const outName = `KKS_Clip_${batchId}_0${i + 1}.mp4`;
+          const clip = await renderClipToMp4({
+            clipSpec: specs[i],
+            clipIndex: i,
+            media,
+            aspectRatio,
+            audioMode: "original",
+            jobDir: uploadDir,
+            outputFilename: outName,
+          });
+          renderedClips.push(clip);
+        }
+
+        fs.rmSync(uploadDir, { recursive: true, force: true });
+
+        res.json({
+          sourceTitle: media.title,
+          clips: renderedClips,
+        });
+      } catch (err) {
+        console.error("Upload error:", err);
+        res.status(500).json({ error: "ဗီဒီယို ဖြတ်တောက်ရာတွင် အခက်အခဲ ဖြစ်ပေါ်ခဲ့ပါသည်။" });
+      }
+    }
+  );
+
+  // Main URL Video Intelligence & Hard-coded Burmese Subtitle MP4 Clipping Endpoint
+  app.post("/api/recap/process", async (req, res) => {
+    const rawUrl = String(req.body?.url || "").trim();
+    const aspectRatio: "9:16" | "16:9" | "1:1" =
+      req.body?.aspectRatio === "16:9" ? "16:9" : req.body?.aspectRatio === "1:1" ? "1:1" : "9:16";
+    const audioMode: "original" | "voiceover" | "mix" =
+      req.body?.audioMode === "voiceover" || req.body?.audioMode === "mix"
+        ? req.body.audioMode
+        : "original";
+    const clipDuration: number = Number(req.body?.durationSec) || 12;
+    const framingMode: "blur_bg" | "crop_fill" | "letterbox" =
+      req.body?.framingMode === "crop_fill" || req.body?.framingMode === "letterbox"
+        ? req.body.framingMode
+        : "blur_bg";
+    const styleOptions: SubtitleStyleOptions = req.body?.styleOptions || {
+      theme: "gold",
+      fontSize: "md",
+      position: "bottom",
+    };
+
+    if (!rawUrl) {
+      res.status(400).json({ error: "ကျေးဇူးပြု၍ ဗီဒီယို Link တစ်ခု ထည့်သွင်းပေးပါ။" });
+      return;
+    }
+
+    // Fast Cache Check (within 15 minutes) to prevent redundant encoding & avoid external rate limits
+    const cacheKey = `${rawUrl}::${aspectRatio}::${audioMode}::${clipDuration}::${framingMode}::${styleOptions.theme}`;
+    const cachedEntry = recapResultCache.get(cacheKey);
+    if (cachedEntry && Date.now() - cachedEntry.timestamp < 15 * 60 * 1000) {
+      const allFilesExist = cachedEntry.clips.every((c) =>
+        fs.existsSync(path.join(CLIPS_DIR, c.filename))
+      );
+      if (allFilesExist) {
+        res.json({
+          sourceTitle: cachedEntry.sourceTitle,
+          clips: cachedEntry.clips,
+        });
+        return;
+      }
+    }
+
+    const jobId = `job_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`;
+    const jobDir = path.join(TMP_JOBS_DIR, jobId);
+    fs.mkdirSync(jobDir, { recursive: true });
+
+    try {
+      const media = await extractSourceMedia(rawUrl, jobDir);
+      const specs = await analyzeVideoWithGemini(media, clipDuration);
+      const batchId = `${Date.now().toString(36)}_${crypto.randomBytes(2).toString("hex")}`;
+
+      // Render Highlight Clip 1 immediately
+      const outName1 = `KKS_Clip_${batchId}_01.mp4`;
+      const clip1 = await renderClipToMp4({
+        clipSpec: specs[0],
+        clipIndex: 0,
+        media,
+        aspectRatio,
+        audioMode,
+        framingMode,
+        styleOptions,
+        jobDir,
+        outputFilename: outName1,
+      });
+
+      // Render remaining clips in parallel with 6s timeout race
+      const remainingPromises = specs.slice(1).map((spec, idx) => {
+        const outName = `KKS_Clip_${batchId}_0${idx + 2}.mp4`;
+        return renderClipToMp4({
+          clipSpec: spec,
+          clipIndex: idx + 1,
+          media,
+          aspectRatio,
+          audioMode,
+          framingMode,
+          styleOptions,
+          jobDir,
+          outputFilename: outName,
+        }).catch((err) => {
+          console.error(`Clip ${idx + 2} render error:`, err);
+          return null;
+        });
+      });
+
+      const remainingResults = await Promise.race([
+        Promise.all(remainingPromises),
+        new Promise<null[]>((resolve) => setTimeout(() => resolve([]), 6000)),
+      ]);
+
+      const renderedClips: RenderedClipResult[] = [clip1];
+      for (const res of remainingResults) {
+        if (res) renderedClips.push(res);
+      }
+
+      // Store in memory cache for instant future serving
+      recapResultCache.set(cacheKey, {
+        sourceTitle: media.title,
+        clips: renderedClips,
+        timestamp: Date.now(),
+      });
+
+      res.json({
+        sourceTitle: media.title,
+        clips: renderedClips,
+      });
+    } catch (err: any) {
+      console.error("Recap process error:", err);
+      const isRate =
+        err &&
+        (err.status === 429 ||
+          err.statusCode === 429 ||
+          (typeof err.message === "string" &&
+            (err.message.includes("Rate exceeded") ||
+              err.message.includes("rate limit") ||
+              err.message.includes("quota") ||
+              err.message.includes("ResourceExhausted"))));
+
+      if (isRate) {
+        res.status(429).json({
+          error:
+            "ဆာဗာ တောင်းဆိုမှု အရေအတွက် ခေတ္တ ပြည့်နေပါသည် (Rate limit exceeded)။ စက္ကန့်အနည်းငယ် စောင့်ဆိုင်းပြီး ထပ်မံ ကြိုးစားပေးပါ။",
+        });
+        return;
+      }
+
+      const message =
+        err instanceof Error
+          ? err.message
+          : "ဗီဒီယိုကို ဖြတ်တောက်ရာတွင် အခက်အခဲ ဖြစ်ပေါ်နေပါသည်။ Link ကို စစ်ဆေးပြီး ထပ်မံကြိုးစားပါ။";
+      res.status(500).json({ error: message });
+    } finally {
+      try {
+        fs.rmSync(jobDir, { recursive: true, force: true });
+      } catch {
+        // Ignore
+      }
+    }
+  });
+
+  if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.resolve(ROOT_DIR, "dist");
+    app.use(express.static(distPath));
+    app.get("*", (_req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  // Global error handler: gracefully catch RangeNotSatisfiableError or uncaught errors
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (
+      err &&
+      (err.name === "RangeNotSatisfiableError" ||
+        err.status === 416 ||
+        err.statusCode === 416 ||
+        (typeof err.message === "string" && err.message.includes("Range Not Satisfiable")))
+    ) {
+      if (!res.headersSent) {
+        res.status(416).setHeader("Content-Range", "bytes */*").end();
+      }
+      return;
+    }
+    console.error("Express unhandled error:", err);
+    if (!res.headersSent) {
+      const isRate =
+        err &&
+        (err.status === 429 ||
+          err.statusCode === 429 ||
+          (typeof err.message === "string" &&
+            (err.message.includes("Rate exceeded") ||
+              err.message.includes("rate limit") ||
+              err.message.includes("quota"))));
+      if (isRate) {
+        res.status(429).json({
+          error:
+            "ဆာဗာ တောင်းဆိုမှု အရေအတွက် ခေတ္တ ပြည့်နေပါသည် (Rate limit exceeded)။ စက္ကန့်အနည်းငယ် စောင့်ဆိုင်းပြီး ထပ်မံ ကြိုးစားပေးပါ။",
+        });
+        return;
+      }
+      res.status(err.status || 500).json({ error: err.message || "Internal server error" });
+    }
+  });
+
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`KKS Recap AI (Gold Mode) server listening on http://0.0.0.0:${PORT}`);
+  });
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
+  server.setTimeout(180000);
+}
+
+startServer();

@@ -1,0 +1,152 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: "Outfit", "Noto Sans Myanmar", "Pyidaungsu", "Padauk", sans-serif;
+    --font-sans: "Plus Jakarta Sans", "Noto Sans Myanmar", "Pyidaungsu", "Padauk", sans-serif;
+    --font-myanmar: "Noto Sans Myanmar", "Pyidaungsu", "Padauk", "Myanmar Text", "Plus Jakarta Sans", sans-serif;
+    --font-mono: "JetBrains Mono", monospace;
+  }
+
+  html {
+    font-family: var(--font-sans);
+    background-color: #000000;
+    color: #f4f4f6;
+    scroll-behavior: smooth;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -webkit-text-size-adjust: 100%;
+    overflow-x: hidden;
+    max-width: 100%;
+  }
+
+  body {
+    min-height: 100vh;
+    min-height: 100dvh;
+    background-color: #000000;
+    overflow-x: hidden;
+    max-width: 100%;
+  }
+
+  button,
+  a,
+  input,
+  select,
+  textarea,
+  [role="button"] {
+    touch-action: manipulation;
+  }
+
+  /* Custom Amber Gold scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #0a0a0c;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #d97706;
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #f59e0b;
+  }
+}
+
+.font-display-gold {
+  font-family: "Outfit", "Cinzel", var(--font-myanmar);
+}
+
+.font-burmese {
+  font-family: var(--font-myanmar);
+  line-height: 1.9;
+  letter-spacing: 0.01em;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "kern" 1, "liga" 1, "calt" 1;
+  overflow-wrap: break-word;
+}
+
+.burmese-heading {
+  font-family: var(--font-myanmar);
+  line-height: 1.72;
+  padding-top: 0.08em;
+  padding-bottom: 0.08em;
+  text-rendering: optimizeLegibility;
+}
+
+.burmese-body {
+  font-family: var(--font-myanmar);
+  line-height: 1.95;
+  text-rendering: optimizeLegibility;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+  font-family: "JetBrains Mono", monospace;
+}
+
+/* KKS Cyber Gold Glow Effects */
+.gold-glow {
+  box-shadow: 0 0 25px rgba(245, 158, 11, 0.28);
+}
+
+.gold-glow-lg {
+  box-shadow: 0 0 45px rgba(245, 158, 11, 0.42);
+}
+
+.gold-text-glow {
+  text-shadow: 0 0 20px rgba(245, 158, 11, 0.55);
+}
+
+.cyan-glow {
+  box-shadow: 0 0 20px rgba(56, 189, 248, 0.35);
+}
+
+.pb-safe {
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+}
+
+@media print {
+  html,
+  body {
+    background: #ffffff !important;
+    color: #111827 !important;
+    min-height: auto !important;
+    font-family: "Noto Sans Myanmar", "Pyidaungsu", "Padauk", "Myanmar Text", sans-serif !important;
+    line-height: 1.95 !important;
+    text-rendering: optimizeLegibility !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  article,
+  article h1,
+  article h2,
+  article h3,
+  article p,
+  article li,
+  article span,
+  article div {
+    font-family: "Noto Sans Myanmar", "Pyidaungsu", "Padauk", "Myanmar Text", sans-serif !important;
+    overflow-wrap: break-word !important;
+  }
+
+  article .font-mono {
+    font-family: "JetBrains Mono", monospace !important;
+  }
+
+  .print-section {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .print-row {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  @page {
+    margin: 16mm;
+  }
+}

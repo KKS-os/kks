@@ -1,0 +1,6 @@
+{
+  "name": "KKSRecap AI (Gold Mode)",
+  "description": "ဇိမ်ခံ Gold Mode ဒီဇိုင်းဖြင့် မည်သည့် Video Link သို့မဟုတ် Video ဖိုင်ကိုမဆို မြန်မာစာတန်းထိုး တစ်ပါတည်း Hard-code ပါဝင်သော Viral MP4 Clip အတိုများအဖြစ် အလိုအလျောက် ဖြတ်ထုတ်ပေးသည့် AI Video Intelligence Tool",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
